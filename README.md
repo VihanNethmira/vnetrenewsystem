@@ -8,7 +8,7 @@ traffic and extend expiry by 30 days.
 ## Deploy
 
 ```bash
-bash <(curl -Ls https://github.com/VihanNethmira/vnetrenewsystem/blob/main/deploy.sh)
+bash <(curl -Ls https://raw.githubusercontent.com/VihanNethmira/vnetrenewsystem/main/deploy.sh)
 ```
 ## Project structure
 
