@@ -89,6 +89,10 @@ configure_backend_env() {
         CUR_ADMIN_TOKEN=$(grep -oP '(?<=^ADMIN_API_TOKEN=).*' "$ENV_FILE" || true)
         CUR_TG_TOKEN=$(grep -oP '(?<=^TELEGRAM_BOT_TOKEN=).*' "$ENV_FILE" || true)
         CUR_TG_CHAT=$(grep -oP '(?<=^TELEGRAM_CHAT_ID=).*'    "$ENV_FILE" || true)
+        # FIX: this was referenced below but never actually read from the file,
+        # so every re-run of this function generated a brand new Flask secret
+        # key and silently invalidated all existing sessions/cookies.
+        CUR_FLASK_SECRET=$(grep -oP '(?<=^FLASK_SECRET_KEY=).*' "$ENV_FILE" || true)
         echo "  (Press Enter on any field to keep its current value)"
     fi
 
@@ -108,6 +112,11 @@ configure_backend_env() {
     TELEGRAM_CHAT_ID="${IN_TG_CHAT:-$CUR_TG_CHAT}"
     MAX_UPLOAD_MB="${IN_MAX_MB:-5}"
     FLASK_SECRET_KEY="${CUR_FLASK_SECRET:-$(openssl rand -hex 32)}"
+
+    if [ -z "$XUI_BASE_URL" ]; then
+        echo "  WARNING: XUI_BASE_URL is empty. The backend will likely fail to reach 3x-UI"
+        echo "           and every renewal/panel-dependent request may error out."
+    fi
 
     cat <<EOF | sudo tee "$ENV_FILE" > /dev/null
 XUI_BASE_URL=$XUI_BASE_URL
@@ -144,6 +153,31 @@ install_node_if_needed() {
     echo "  → Installing Node.js 20.x (NodeSource)..."
     curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
     sudo apt-get install -y nodejs
+}
+
+# FIX (new): actually verify the backend is reachable end-to-end through Nginx,
+# instead of trusting `systemctl is-active` (which reports "active" even when
+# gunicorn is crash-looping, because Restart=always brings it back up instantly
+# between checks). Retries for a few seconds since services can be slow to bind.
+check_backend_reachable() {
+    local url="https://${DOMAIN}:${PORT}/api/health"
+    local attempt=1
+    local max_attempts=10
+    echo "  → Checking backend reachability at $url ..."
+    while [ $attempt -le $max_attempts ]; do
+        HTTP_CODE=$(curl -sk -o /tmp/backend_health_body -w "%{http_code}" "$url" --max-time 5 || echo "000")
+        if [ "$HTTP_CODE" != "000" ] && [ "$HTTP_CODE" -lt 500 ]; then
+            echo "  → Backend responded with HTTP $HTTP_CODE (attempt $attempt/$max_attempts)."
+            return 0
+        fi
+        echo "  → Attempt $attempt/$max_attempts: got HTTP ${HTTP_CODE:-no response}, retrying..."
+        attempt=$((attempt+1))
+        sleep 2
+    done
+    echo "  → WARNING: backend did not respond successfully after $max_attempts attempts."
+    echo "    Last response body:"
+    cat /tmp/backend_health_body 2>/dev/null || echo "    (no body / connection failed)"
+    return 1
 }
 
 # ─────────────────────────────────────────────
@@ -248,14 +282,26 @@ if [ "$MAIN_OPT" == "1" ] || [ "$MAIN_OPT" == "2" ]; then
 
     echo "  → Verifying app.py loads..."
     cd "$WORK_DIR/backend"
-    python3 -c "import app" && echo "  → app.py OK" || { echo "ERROR: app.py failed to import. Check dependencies."; exit 1; }
+    # FIX: previously any import error was swallowed with a generic message.
+    # Now the real Python traceback is printed so the actual cause (missing
+    # dependency, bad import, syntax error, etc.) is visible immediately.
+    if ! python3 -c "import app"; then
+        echo "ERROR: app.py failed to import. See traceback above for the exact cause."
+        deactivate
+        exit 1
+    fi
+    echo "  → app.py OK"
     deactivate
 
     # ── Frontend build ─────────────────────────────
     echo "[5/7] Building frontend (Next.js)..."
     # NEXT_PUBLIC_* vars are baked in at build time, so write them before building.
+    # NOTE: no trailing /api here — the frontend code (page.js, admin/page.js)
+    # already appends /api/... itself. Adding it here caused every request to
+    # hit /api/api/... (404 -> HTML response -> res.json() throws -> caught
+    # as "Could not reach the server.").
     cat <<EOF > "$WORK_DIR/frontend/.env.production"
-NEXT_PUBLIC_API_URL=https://$DOMAIN/api
+NEXT_PUBLIC_API_URL=https://$DOMAIN:$PORT
 EOF
     cd "$WORK_DIR/frontend"
     npm install --no-audit --no-fund
@@ -318,6 +364,12 @@ EOF
         echo "  → SSL cert already exists for $DOMAIN, skipping certbot."
     fi
 
+    if [ ! -f "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" ]; then
+        echo "ERROR: SSL certificate still missing for $DOMAIN after certbot step."
+        echo "       Nginx will fail to start without it. Re-run certbot manually, then re-run this script."
+        exit 1
+    fi
+
     # ── Nginx Config ───────────────────────────────
     # Frontend (Next.js) serves everything by default;
     # /api/ is proxied straight to the Flask backend (routes already include /api prefix).
@@ -377,9 +429,20 @@ EOF
     echo ""
     echo "================================================"
     if $BACKEND_OK && $FRONTEND_OK; then
-        echo "  SUCCESS: Renewal system $SELECTED_TAG is live!"
-        echo "  URL         : https://$DOMAIN:$PORT"
-        echo "  Admin panel : https://$DOMAIN:$PORT/admin"
+        # FIX: process being "active" doesn't mean it's actually reachable.
+        # Do a real HTTP check through Nginx before declaring success.
+        if check_backend_reachable; then
+            echo "  SUCCESS: Renewal system $SELECTED_TAG is live!"
+            echo "  URL         : https://$DOMAIN:$PORT"
+            echo "  Admin panel : https://$DOMAIN:$PORT/admin"
+        else
+            echo "  WARNING: Services are active, but the backend did not respond over HTTPS."
+            echo "  Most likely causes:"
+            echo "   - app.py crashing after startup (check: sudo journalctl -u $BACKEND_SERVICE -n 50)"
+            echo "   - wrong/missing XUI_BASE_URL causing startup failure"
+            echo "   - DNS for $DOMAIN not pointing at this server yet"
+            echo "   - firewall/security group blocking port $PORT externally"
+        fi
     else
         echo "  WARNING: One or more services may not have started correctly."
         $BACKEND_OK  || echo "   - backend  : run journalctl -u $BACKEND_SERVICE -n 30"
@@ -398,11 +461,20 @@ elif [ "$MAIN_OPT" == "3" ]; then
     configure_backend_env
 
     sudo systemctl restart "$BACKEND_SERVICE" 2>/dev/null || true
+    sleep 2
 
-    echo ""
-    echo "================================================"
-    echo "  Backend settings updated & service restarted."
-    echo "================================================"
+    if sudo systemctl is-active --quiet "$BACKEND_SERVICE"; then
+        echo ""
+        echo "================================================"
+        echo "  Backend settings updated & service restarted."
+        echo "================================================"
+    else
+        echo ""
+        echo "================================================"
+        echo "  WARNING: backend failed to come back up after restart."
+        echo "  Check: sudo journalctl -u $BACKEND_SERVICE -n 50"
+        echo "================================================"
+    fi
 
 # ─────────────────────────────────────────────
 #   4 — UNINSTALL
