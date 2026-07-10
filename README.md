@@ -5,6 +5,11 @@ no new configs are ever created. Customers submit a renewal request + payment
 slip; the admin approves it; the backend automates the 3x-UI panel to reset
 traffic and extend expiry by 30 days.
 
+## Deploy
+
+```bash
+bash <(curl -Ls https://github.com/VihanNethmira/vnetrenewsystem/blob/main/deploy.sh)
+```
 ## Project structure
 
 ```
